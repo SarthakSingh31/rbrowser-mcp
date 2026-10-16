@@ -1,189 +1,92 @@
-use std::{borrow::Cow, ops::Deref, sync::Arc, time::Duration};
+use std::path::PathBuf;
 
-use base64::Engine;
-use chaser_oxide::{
-    Browser, BrowserConfig, ChaserPage, cdp::browser_protocol::page::CaptureScreenshotParams,
-};
-use futures::StreamExt;
-use rmcp::{
-    ServiceExt,
-    handler::server::wrapper::Parameters,
-    model::{CallToolResult, ContentBlock},
-    schemars,
-};
-use tokio::{
-    sync::{RwLock, RwLockReadGuard},
-    task::JoinHandle,
-};
+use clap::Parser;
+use rmcp::ServiceExt;
 
+mod browser;
 mod error;
+mod reaper;
+mod server;
 mod snapshot;
 
+use browser::Mode;
 use error::Error;
+use server::{BrowserMcp, Config};
 
-pub struct Guard<'g, A, T> {
-    #[allow(unused)]
-    lock: RwLockReadGuard<'g, A>,
-    data: T,
+#[derive(Debug, Parser)]
+#[command(version, about = "An MCP server that lets an agent drive Chrome")]
+struct Args {
+    /// Open new pages in a visible window instead of headless
+    #[arg(long)]
+    headed: bool,
+    /// Number of open pages above which open_page warns the agent to close some
+    #[arg(long, default_value_t = 5)]
+    max_pages: usize,
+    /// Path to the Chrome/Chromium executable (auto-detected by default)
+    #[arg(long)]
+    chrome_path: Option<PathBuf>,
 }
 
-impl<'g, A, T> Deref for Guard<'g, A, T> {
-    type Target = T;
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
 
-    fn deref(&self) -> &Self::Target {
-        &self.data
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BrowserMcp {
-    browser: Arc<Browser>,
-    current_tab: Arc<RwLock<ChaserPage>>,
-}
-
-impl BrowserMcp {
-    pub async fn new() -> Result<(Self, JoinHandle<anyhow::Result<()>>), Error> {
-        let (browser, mut handler) = Browser::launch(
-            BrowserConfig::builder()
-                .viewport(None)
-                .build()
-                .map_err(|e| Error::FailedToBuildConfig(e))?,
-        )
-        .await?;
-
-        let handle = tokio::spawn(async move {
-            while let Some(r) = handler.next().await {
-                r?;
-            }
-
-            Ok(())
-        });
-
-        // Wait for window to open
-
-        let version = browser.version().await?;
-        tracing::info!("Running version: {version:?}");
-
-        let start_tab = loop {
-            if let Some(page) = browser.pages().await?.pop() {
-                break page;
-            }
-
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        };
-
-        let chaser = ChaserPage::new(start_tab.clone());
-        chaser
-            .apply_native_profile()
-            .await
-            .expect("Failed to apply native profile");
-
-        Ok((
-            BrowserMcp {
-                browser: Arc::new(browser),
-                current_tab: Arc::new(RwLock::const_new(chaser)),
-            },
-            handle,
-        ))
-    }
-}
-
-impl Drop for BrowserMcp {
-    fn drop(&mut self) {
-        Arc::get_mut(&mut self.browser).map(|b| b.close());
-    }
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
-struct NavigateParams {
-    /// The url to naviagte to
-    url: String,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
-struct EvaluateToolArg {
-    /// The script we want to evaluate on the current page
-    script: Cow<'static, str>,
-}
-
-#[rmcp::tool_router]
-impl BrowserMcp {
-    #[rmcp::tool(description = "Navigate to a url on the current tab")]
-    async fn navigate(
-        &self,
-        Parameters(args): Parameters<NavigateParams>,
-    ) -> Result<String, Error> {
-        let page = self.current_tab.read().await;
-        page.goto(&args.url).await?;
-
-        Ok("Success".into())
-    }
-
-    #[rmcp::tool(
-        description = "Evaluate a expression or function on the current page and get its response"
-    )]
-    async fn evaluate(
-        &self,
-        Parameters(arg): Parameters<EvaluateToolArg>,
-    ) -> Result<CallToolResult, Error> {
-        let page = self.current_tab.read().await;
-
-        if let Some(r) = page.evaluate_stealth(&*arg.script).await? {
-            Ok(CallToolResult::structured(r))
-        } else {
-            Ok(CallToolResult::success(vec![]))
+        let mut term = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+        let mut hangup = signal(SignalKind::hangup()).expect("failed to install SIGHUP handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+            _ = hangup.recv() => {}
         }
     }
-
-    #[rmcp::tool(description = "Get a screenshot of the current page")]
-    async fn screenshot(&self) -> Result<CallToolResult, Error> {
-        let page = self.current_tab.read().await;
-        let image = page
-            .raw_page()
-            .screenshot(CaptureScreenshotParams {
-                format: None,
-                quality: Some(100),
-                clip: None,
-                from_surface: None,
-                capture_beyond_viewport: None,
-                optimize_for_speed: None,
-            })
-            .await?;
-
-        Ok(CallToolResult::success(vec![ContentBlock::image(
-            base64::engine::general_purpose::STANDARD.encode(image),
-            "image/png",
-        )]))
-    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
 }
-
-#[rmcp::tool_handler(
-    name = "rbrowser-mcp",
-    version = "0.0.1",
-    instructions = "A MCP to allow the agent to interact with the browser"
-)]
-impl rmcp::ServerHandler for BrowserMcp {}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    reaper::exec_chrome_if_wrapper();
+
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(std::io::stderr)
         .init();
 
+    let args = Args::parse();
+
     tracing::info!("Starting MCP server!");
 
-    let (mcp, handle) = BrowserMcp::new().await?;
+    // The browser is launched lazily on the first open_page.
+    let mcp = BrowserMcp::new(Config {
+        default_mode: if args.headed {
+            Mode::Visible
+        } else {
+            Mode::Headless
+        },
+        max_pages: args.max_pages,
+        chrome_path: args.chrome_path,
+    });
 
-    tracing::info!("Launched the browser!");
-
-    let service = mcp.serve(rmcp::transport::stdio()).await?;
+    let service = mcp.clone().serve(rmcp::transport::stdio()).await?;
 
     tracing::info!("MCP server started!");
 
-    service.waiting().await?;
+    let result = tokio::select! {
+        r = service.waiting() => r.map(|_| ()).map_err(anyhow::Error::from),
+        _ = shutdown_signal() => {
+            tracing::info!("Received shutdown signal");
+            Ok(())
+        }
+    };
 
-    handle.await??;
+    mcp.shutdown().await;
 
-    Ok(())
+    // Exit explicitly: after a signal, tokio's stdin reader is still blocked in a read and would
+    // keep the runtime from shutting down.
+    if let Err(e) = result {
+        tracing::error!("{e:?}");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
 }

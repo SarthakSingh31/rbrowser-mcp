@@ -1,4 +1,4 @@
-use chaser_oxide::ChaserPage;
+use chromiumoxide::Page;
 use rustc_hash::FxHashMap;
 
 const SNAPSHOT_SCRIPT: &str = include_str!("snapshot.js");
@@ -19,11 +19,10 @@ pub struct SnapshotNode {
     pub text: String,
 }
 
-pub async fn snapshot(page: &ChaserPage) -> Result<SnapshotNode, crate::Error> {
-    let snapshot = page
-        .evaluate_stealth(SNAPSHOT_SCRIPT)
+pub async fn snapshot(page: &Page) -> Result<SnapshotNode, crate::Error> {
+    let snapshot = crate::server::evaluate_isolated(page, SNAPSHOT_SCRIPT)
         .await?
-        .expect("Snapshot returned no data");
+        .ok_or(crate::Error::NotFound)?;
 
     Ok(serde_json::from_value(snapshot)?)
 }
